@@ -104,6 +104,7 @@ func (v RESPValue) Bytes() []byte {
 // Encode encodes the value for the given protocol version (2 or 3).
 func (v RESPValue) Encode(proto int) []byte {
 	var buf bytes.Buffer
+	buf.Grow(int(v.approxSize()))
 	v.writeTo(&buf, proto)
 	return buf.Bytes()
 }

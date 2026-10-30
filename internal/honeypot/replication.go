@@ -165,7 +165,7 @@ func (s *RedisServer) buildRDB() []byte {
 	aux(verKey, s.profile.Version)
 	aux("redis-bits", "64")
 	aux("ctime", strconv.FormatInt(time.Now().Unix(), 10))
-	usedMemory, _, _ := s.runtime.memory(s.budget.bytes())
+	usedMemory, _, _ := s.runtime.memory(s.shownDataBytes())
 	aux("used-mem", strconv.FormatInt(usedMemory, 10))
 	if s.profile.atLeast(4, 0) {
 		aux("repl-stream-db", "0")

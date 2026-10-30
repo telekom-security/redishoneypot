@@ -4,8 +4,15 @@ import "sync/atomic"
 
 const (
 	defaultMaxDataBytes = 64 << 20
-	// entryOverhead approximates what Redis spends per key beside its bytes.
-	entryOverhead = 64
+	// entryOverhead is what a key costs the honeypot beside its bytes: the
+	// map slot, the string headers and the rounding of its allocations
+	// (about 120 bytes for short keys in Go).
+	entryOverhead = 128
+	// redisEntryOverhead is what Redis spends per key; INFO reports it.
+	redisEntryOverhead = 64
+	// keyReplyOverhead is what one key of a KEYS or SCAN reply costs while
+	// it is built and encoded, beside the key's bytes.
+	keyReplyOverhead = 96
 	// maxScriptCacheBytes caps the script cache within the data budget.
 	maxScriptCacheBytes = 8 << 20
 )
@@ -57,4 +64,18 @@ func (b *memBudget) bytes() int64 {
 
 func entrySize(key, value string) int64 {
 	return int64(len(key) + len(value) + entryOverhead)
+}
+
+func keyReplyCost(key string) int64 {
+	return int64(len(key) + keyReplyOverhead)
+}
+
+// shownDataBytes is the data INFO and the RDB header report: the budget with
+// Redis' overhead per key instead of the honeypot's.
+func (s *RedisServer) shownDataBytes() int64 {
+	shown := s.budget.bytes() - s.store.KeyCount()*(entryOverhead-redisEntryOverhead)
+	if shown < 0 {
+		return 0
+	}
+	return shown
 }

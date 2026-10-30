@@ -226,26 +226,90 @@ func (s *Store) Del(db int, keys []string) int {
 }
 
 func (s *Store) Keys(db int, pattern string) []string {
+	keys, _ := s.KeysWithin(db, pattern, nil)
+	return keys
+}
+
+// KeysWithin returns the live keys of db that match pattern, sorted. It first
+// hands fit what their reply costs (keyReplyCost each) and builds nothing
+// when fit refuses; a nil fit takes any cost.
+func (s *Store) KeysWithin(db int, pattern string, fit func(cost int64) bool) ([]string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	values := s.dbs[db]
 	if values == nil {
-		return nil
+		return nil, fit == nil || fit(0)
 	}
 
 	now := time.Now()
 	allKeys := pattern == "*"
-	keys := make([]string, 0, len(values))
+	count := 0
+	var cost int64
 	for key := range values {
 		if _, ok := s.lookup(db, key, now); !ok {
 			continue
 		}
 		if allKeys || stringMatch(pattern, key, false) {
+			count++
+			cost += keyReplyCost(key)
+		}
+	}
+	if fit != nil && !fit(cost) {
+		return nil, false
+	}
+	keys := make([]string, 0, count)
+	for key := range values {
+		if allKeys || stringMatch(pattern, key, false) {
 			keys = append(keys, key)
 		}
 	}
 	sort.Strings(keys)
-	return keys
+	return keys, true
+}
+
+// KeyCount returns the keys of all databases, expired ones not yet removed
+// included.
+func (s *Store) KeyCount() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var count int64
+	for _, stats := range s.stats {
+		count += int64(stats.keys)
+	}
+	return count
+}
+
+// SizeHistogram counts the live string values of each database per power of
+// two of their length (0 for empty values), without copying the keyspace.
+func (s *Store) SizeHistogram() map[int]map[int64]int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	out := make(map[int]map[int64]int, len(s.dbs))
+	for db, values := range s.dbs {
+		buckets := map[int64]int{}
+		for _, entry := range values {
+			if entry.expired(now) {
+				continue
+			}
+			buckets[powerOfTwoBucket(int64(len(entry.value)))]++
+		}
+		if len(buckets) > 0 {
+			out[db] = buckets
+		}
+	}
+	return out
+}
+
+func powerOfTwoBucket(size int64) int64 {
+	if size <= 0 {
+		return 0
+	}
+	bucket := int64(1)
+	for bucket*2 <= size {
+		bucket *= 2
+	}
+	return bucket
 }
 
 func (s *Store) Size(db int) int {
