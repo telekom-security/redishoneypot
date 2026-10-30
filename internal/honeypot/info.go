@@ -96,7 +96,7 @@ func (s *RedisServer) infoValues(state *clientState) map[string]string {
 		port = tcpAddr.Port
 	}
 
-	usedMemory, rss, peak := fp.memory(s.budget.bytes())
+	usedMemory, rss, peak := fp.memory(s.shownDataBytes())
 	peakPercent := 100.0
 	if peak > 0 {
 		peakPercent = float64(usedMemory) / float64(peak) * 100
@@ -199,26 +199,15 @@ func (s *RedisServer) keyspaceLines() []string {
 
 // keysizesLines renders Redis 8's power-of-two string length histogram.
 func (s *RedisServer) keysizesLines() []string {
-	snapshot := s.store.Snapshot()
-	dbs := make([]int, 0, len(snapshot))
-	for db := range snapshot {
+	histogram := s.store.SizeHistogram()
+	dbs := make([]int, 0, len(histogram))
+	for db := range histogram {
 		dbs = append(dbs, db)
 	}
 	sort.Ints(dbs)
 	var lines []string
 	for _, db := range dbs {
-		buckets := map[int64]int{}
-		for _, entry := range snapshot[db] {
-			size := int64(len(entry.value))
-			bucket := int64(0)
-			if size > 0 {
-				bucket = 1
-				for bucket*2 <= size {
-					bucket *= 2
-				}
-			}
-			buckets[bucket]++
-		}
+		buckets := histogram[db]
 		keys := make([]int64, 0, len(buckets))
 		for bucket := range buckets {
 			keys = append(keys, bucket)

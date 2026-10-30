@@ -419,3 +419,101 @@ func TestReplicaStateIsPerSource(t *testing.T) {
 		t.Fatalf("ROLE of A after the TTL got %q", got)
 	}
 }
+
+func TestKeysAndScanCountAgainstReplyBudget(t *testing.T) {
+	server, stop := startLoggedServer(t, func(o *ServerOptions) {
+		o.MaxReplyBytes = 100 * 1024
+	})
+	state := &clientState{connected: time.Now()}
+	for i := 0; i < 2000; i++ {
+		call(server, state, "SET", "key:"+strconv.Itoa(i)+strings.Repeat("k", 32), "v")
+	}
+	call(server, state, "SET", "single", "v")
+
+	conn, reader := dialServer(t, server)
+	sendArgs(t, conn, "KEYS", "single")
+	if got := readRESP(t, reader); got != "*1\r\n$6\r\nsingle\r\n" {
+		t.Fatalf("KEYS single got %q", got)
+	}
+	for _, args := range [][]string{{"KEYS", "*"}, {"SCAN", "0", "COUNT", "10"}} {
+		conn, reader := dialServer(t, server)
+		sendArgs(t, conn, args...)
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if rest, _ := io.ReadAll(reader); len(rest) != 0 {
+			t.Fatalf("%v got %d bytes, want the connection closed without a reply", args, len(rest))
+		}
+		if server.replyBytes.Load() != 0 {
+			t.Fatalf("%v: reply budget holds %d bytes", args, server.replyBytes.Load())
+		}
+	}
+
+	events := decodeLogEvents(t, stop())
+	for _, command := range []string{"KEYS", "SCAN"} {
+		limited := false
+		for _, event := range events {
+			if event["event"] == "command" && event["command"] == command && event["reply_limited"] == true {
+				limited = event["outcome"] == "connection_closed"
+			}
+		}
+		if !limited {
+			t.Fatalf("no reply_limited %s event with outcome connection_closed", command)
+		}
+	}
+}
+
+func TestKeysWithinBuildsNothingWhenRefused(t *testing.T) {
+	store := NewStore()
+	store.Set(0, "a", "1")
+	store.Set(0, "bb", "2")
+	var asked int64
+	keys, fits := store.KeysWithin(0, "*", func(cost int64) bool {
+		asked = cost
+		return false
+	})
+	if fits || keys != nil {
+		t.Fatalf("refused KeysWithin returned %v, %v", keys, fits)
+	}
+	if want := keyReplyCost("a") + keyReplyCost("bb"); asked != want {
+		t.Fatalf("cost %d, want %d", asked, want)
+	}
+	if keys, fits := store.KeysWithin(0, "b*", nil); !fits || len(keys) != 1 || keys[0] != "bb" {
+		t.Fatalf("KeysWithin b* got %v, %v", keys, fits)
+	}
+}
+
+func TestBudgetCountsGoOverheadInfoShowsRedis(t *testing.T) {
+	options := DefaultServerOptions()
+	options.Address = "127.0.0.1:0"
+	options.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	server, err := NewRedisServerWithOptions(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(server.Stop)
+	state := &clientState{connected: time.Now()}
+	before := parseInfoInt(t, parseInfo(t, infoText(server, "memory")), "used_memory")
+	budgetBefore := server.budget.bytes()
+	for i := 0; i < 100; i++ {
+		call(server, state, "SET", "k"+strconv.Itoa(1000+i), "v")
+	}
+	if got, want := server.budget.bytes()-budgetBefore, int64(100*(5+1+entryOverhead)); got != want {
+		t.Fatalf("budget grew by %d, want %d", got, want)
+	}
+	after := parseInfoInt(t, parseInfo(t, infoText(server, "memory")), "used_memory")
+	if got, want := after-before, int64(100*(5+1+redisEntryOverhead)); got != want {
+		t.Fatalf("used_memory grew by %d, want %d", got, want)
+	}
+}
+
+func TestSizeHistogramSkipsExpired(t *testing.T) {
+	store := NewStore()
+	store.Set(0, "empty", "")
+	store.Set(0, "one", "x")
+	store.Set(0, "three", "xyz")
+	store.Set(1, "big", strings.Repeat("x", 1500))
+	store.SetWithExpiry(2, "gone", "x", time.Now().Add(-time.Second), false)
+	got := store.SizeHistogram()
+	if len(got) != 2 || got[0][0] != 1 || got[0][1] != 1 || got[0][2] != 1 || got[1][1024] != 1 {
+		t.Fatalf("SizeHistogram got %v", got)
+	}
+}

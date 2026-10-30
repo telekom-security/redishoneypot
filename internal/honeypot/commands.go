@@ -23,7 +23,7 @@ type commandResult struct {
 	rejected bool
 	statName string
 	// reserved is the reply size the command already counted against
-	// MaxReplyBytes (SYNC); handleConn releases it after the write.
+	// MaxReplyBytes (SYNC, KEYS, SCAN); handleConn releases it after the write.
 	reserved int64
 	// replyLimited marks a reply dropped for MaxReplyBytes.
 	replyLimited bool
@@ -175,9 +175,9 @@ func (s *RedisServer) execute(state *clientState, name string, args []string) co
 	case "exists":
 		return ok(IntegerReply(int64(s.store.Exists(state.db, args[1:]))))
 	case "keys":
-		return ok(BulkArray(s.store.Keys(state.db, args[1])))
+		return s.keysResult(state.db, args[1], nil)
 	case "scan":
-		return ok(s.handleScan(state, args))
+		return s.handleScan(state, args)
 	case "type":
 		if _, exists := s.store.Get(state.db, args[1]); exists {
 			return ok(SimpleString("string"))
@@ -530,15 +530,15 @@ func (s *RedisServer) handleExpire(state *clientState, name string, args []strin
 	return IntegerReply(0)
 }
 
-func (s *RedisServer) handleScan(state *clientState, args []string) RESPValue {
+func (s *RedisServer) handleScan(state *clientState, args []string) commandResult {
 	if _, err := strconv.ParseUint(args[1], 10, 64); err != nil {
-		return ErrorReply("ERR invalid cursor")
+		return ok(ErrorReply("ERR invalid cursor"))
 	}
 	pattern := "*"
 	typeFilter := ""
 	for i := 2; i < len(args); i++ {
 		if i+1 >= len(args) {
-			return syntaxError
+			return ok(syntaxError)
 		}
 		switch strings.ToUpper(args[i]) {
 		case "MATCH":
@@ -546,23 +546,51 @@ func (s *RedisServer) handleScan(state *clientState, args []string) RESPValue {
 		case "COUNT":
 			count, err := strconv.ParseInt(args[i+1], 10, 64)
 			if err != nil {
-				return notIntegerErr
+				return ok(notIntegerErr)
 			}
 			if count < 1 {
-				return syntaxError
+				return ok(syntaxError)
 			}
 		case "TYPE":
 			typeFilter = strings.ToLower(args[i+1])
 		default:
-			return syntaxError
+			return ok(syntaxError)
 		}
 		i++
 	}
-	keys := s.store.Keys(state.db, pattern)
 	if typeFilter != "" && typeFilter != "string" {
-		keys = nil
+		return ok(Array(BulkString("0"), Array()))
 	}
-	return Array(BulkString("0"), BulkArray(keys))
+	return s.keysResult(state.db, pattern, func(keys RESPValue) RESPValue {
+		return Array(BulkString("0"), keys)
+	})
+}
+
+// keysResult answers KEYS and SCAN. What their reply costs counts against
+// MaxReplyBytes before it is built; when it does not fit, the connection is
+// closed without a reply, like Redis' output buffer limit.
+func (s *RedisServer) keysResult(db int, pattern string, wrap func(RESPValue) RESPValue) commandResult {
+	var reserved int64
+	keys, fits := s.store.KeysWithin(db, pattern, func(cost int64) bool {
+		if cost < largeReplyBytes {
+			return true
+		}
+		if !s.reserveReply(cost) {
+			return false
+		}
+		reserved = cost
+		return true
+	})
+	if !fits {
+		return commandResult{reply: RawReply(""), silent: true, close: true, replyLimited: true}
+	}
+	reply := BulkArray(keys)
+	if wrap != nil {
+		reply = wrap(reply)
+	}
+	result := ok(reply)
+	result.reserved = reserved
+	return result
 }
 
 func (s *RedisServer) configValue(key string) string {

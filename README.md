@@ -58,7 +58,8 @@ Useful flags:
 ## Limits
 
 Worst-case memory is roughly `max-clients × max-command-bytes` for the
-parser plus `max-data-bytes` plus `max-reply-bytes`. The Docker image uses
+parser plus `max-data-bytes` plus `max-reply-bytes` plus about 20 MiB for the
+Go runtime. The Docker image uses
 `-max-clients 128 -max-command-bytes 1048576 -max-data-bytes 33554432
 -max-reply-bytes 33554432` and `GOMEMLIMIT=200MiB` with a 256 MiB Compose
 memory limit. `INFO` keeps reporting the persona's `maxclients:10000`.
@@ -69,17 +70,20 @@ memory limit. `INFO` keeps reporting the persona's `maxclients:10000`.
   (`max_clients` or `max_clients_per_ip`) and `refused_count`; one source
   address gets at most one such line per minute, `refused_count` includes the
   refusals in between.
-- **Data.** Keys count with their key, value and 64 bytes each; cached scripts
+- **Data.** Keys count with their key, value and the 128 bytes Go spends on
+  each (`used_memory` in `INFO` shows Redis' 64 bytes per key); cached scripts
   (at most 1024 and 8 MiB, the oldest are dropped) and CONFIG values longer
   than the persona's defaults count too. A `SET` or `CONFIG SET` above
   `-max-data-bytes` gets `-OOM command not allowed when used memory >
   'maxmemory'.`; a script that does not fit is answered but not cached.
   `used_memory` in `INFO` is the persona's idle value plus these bytes.
-- **Replies.** A reply of 64 KiB or more (`GET`, `KEYS`, `SYNC` / `PSYNC`, ...)
-  counts against `-max-reply-bytes` until it is written. A connection whose
-  reply does not fit is closed without a reply, like Redis' output buffer
-  limit; its `command` event has `outcome` `connection_closed` and
-  `reply_limited`.
+  `INFO keysizes` counts value sizes without copying the keyspace.
+- **Replies.** A reply of 64 KiB or more (`GET`, `KEYS`, `SCAN`, `SYNC` /
+  `PSYNC`, ...) counts against `-max-reply-bytes` until it is written; `KEYS`
+  and `SCAN` count their keys (each with 96 bytes) before they build the reply
+  and build nothing when it does not fit. A connection whose reply does not
+  fit is closed without a reply, like Redis' output buffer limit; its
+  `command` event has `outcome` `connection_closed` and `reply_limited`.
 - **Client metadata.** The connection keeps at most 4 KiB of `CLIENT SETNAME`,
   `HELLO ... SETNAME` and `CLIENT SETINFO` values; `CLIENT SETINFO` refuses
   spaces, newlines and special characters like Redis 7.2.
