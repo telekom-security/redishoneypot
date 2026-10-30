@@ -2,6 +2,7 @@ package honeypot
 
 import (
 	"fmt"
+	"math"
 	"path"
 	"sort"
 	"strconv"
@@ -21,6 +22,11 @@ type commandResult struct {
 	// subcommand); they count as rejected_calls in commandstats.
 	rejected bool
 	statName string
+	// reserved is the reply size the command already counted against
+	// MaxReplyBytes (SYNC); handleConn releases it after the write.
+	reserved int64
+	// replyLimited marks a reply dropped for MaxReplyBytes.
+	replyLimited bool
 }
 
 // emulatedCommands are executed by the honeypot. Commands the persona knows
@@ -96,7 +102,7 @@ func (s *RedisServer) handleCommand(state *clientState, args []string) commandRe
 		statName = sub
 	}
 
-	if entry.flags["write"] && s.isReadOnlyReplica() {
+	if entry.flags["write"] && s.isReadOnlyReplica(state) {
 		result := ok(readonlyErr)
 		result.statName = statName
 		return result
@@ -185,9 +191,9 @@ func (s *RedisServer) execute(state *clientState, name string, args []string) co
 		case !hasTTL:
 			return ok(IntegerReply(-1))
 		case name == "pttl":
-			return ok(IntegerReply(remaining.Milliseconds()))
+			return ok(IntegerReply(remaining))
 		default:
-			return ok(IntegerReply((remaining.Milliseconds() + 500) / 1000))
+			return ok(IntegerReply((remaining + 500) / 1000))
 		}
 	case "expire", "pexpire":
 		return ok(s.handleExpire(state, name, args))
@@ -246,7 +252,7 @@ func (s *RedisServer) execute(state *clientState, name string, args []string) co
 	case "debug":
 		return ok(s.handleDebug(state, args))
 	case "role":
-		return ok(s.handleRole())
+		return ok(s.handleRole(state))
 	case "time":
 		now := time.Now()
 		return ok(Array(
@@ -254,14 +260,14 @@ func (s *RedisServer) execute(state *clientState, name string, args []string) co
 			BulkString(strconv.FormatInt(int64(now.Nanosecond()/1000), 10)),
 		))
 	case "slaveof", "replicaof":
-		return ok(s.handleReplicaOf(args))
+		return ok(s.handleReplicaOf(state, args))
 	case "replconf":
 		if strings.EqualFold(args[1], "ack") || strings.EqualFold(args[1], "fack") {
 			return commandResult{noReply: true}
 		}
 		return ok(SimpleString("OK"))
 	case "psync", "sync":
-		return ok(s.handleSync(state, name))
+		return s.handleSync(state, name)
 	case "eval", "eval_ro", "evalsha", "evalsha_ro":
 		return ok(s.handleEval(name, args))
 	case "script":
@@ -389,7 +395,7 @@ func (s *RedisServer) handleHello(state *clientState, args []string) RESPValue {
 			if !validClientName(args[i+1]) {
 				return ErrorReply("ERR Client names cannot contain spaces, newlines or special characters.")
 			}
-			name = args[i+1]
+			name = capClientAttr(args[i+1])
 			i++
 		default:
 			return errorf("ERR Syntax error in HELLO option '%s'", args[i])
@@ -399,7 +405,7 @@ func (s *RedisServer) handleHello(state *clientState, args []string) RESPValue {
 	state.name = name
 
 	role := "master"
-	if s.isReplica() {
+	if s.isReplica(state) {
 		role = "replica"
 	}
 	return Map(
@@ -435,22 +441,15 @@ func (s *RedisServer) handleSet(state *clientState, args []string) RESPValue {
 			if err != nil {
 				return notIntegerErr
 			}
-			if amount <= 0 {
+			ms, valid := expireMillis(amount, option == "EX" || option == "EXAT",
+				option == "EXAT" || option == "PXAT", modern)
+			if amount <= 0 || !valid {
 				if s.profile.modernErrors() {
 					return ErrorReply("ERR invalid expire time in 'set' command")
 				}
 				return ErrorReply("ERR invalid expire time in set")
 			}
-			switch option {
-			case "EX":
-				expireAt = time.Now().Add(time.Duration(amount) * time.Second)
-			case "PX":
-				expireAt = time.Now().Add(time.Duration(amount) * time.Millisecond)
-			case "EXAT":
-				expireAt = time.Unix(amount, 0)
-			case "PXAT":
-				expireAt = time.UnixMilli(amount)
-			}
+			expireAt = time.UnixMilli(ms)
 			expireSet = true
 			i++
 		default:
@@ -470,12 +469,38 @@ func (s *RedisServer) handleSet(state *clientState, args []string) RESPValue {
 		return NilBulkString()
 	}
 
-	s.store.SetWithExpiry(state.db, args[1], args[2], expireAt, keepTTL)
+	if !s.store.SetWithExpiry(state.db, args[1], args[2], expireAt, keepTTL) {
+		return oomError
+	}
 	s.runtime.markDirty(1)
 	if get {
 		return oldReply
 	}
 	return SimpleString("OK")
+}
+
+// oomError is Redis' answer to a write above maxmemory.
+var oomError = ErrorReply("OOM command not allowed when used memory > 'maxmemory'.")
+
+// expireMillis turns an expire argument into absolute Unix milliseconds. With
+// checked set it reports an overflow like Redis 6.2 and later; older servers
+// compute with wrapping integers, which is what this does then too.
+func expireMillis(amount int64, seconds bool, absolute bool, checked bool) (int64, bool) {
+	ms := amount
+	if seconds {
+		if checked && (ms > math.MaxInt64/1000 || ms < math.MinInt64/1000) {
+			return 0, false
+		}
+		ms *= 1000
+	}
+	if !absolute {
+		now := time.Now().UnixMilli()
+		if checked && ms > math.MaxInt64-now {
+			return 0, false
+		}
+		ms += now
+	}
+	return ms, true
 }
 
 func (s *RedisServer) handleExpire(state *clientState, name string, args []string) RESPValue {
@@ -495,11 +520,11 @@ func (s *RedisServer) handleExpire(state *clientState, name string, args []strin
 			}
 		}
 	}
-	unit := time.Second
-	if name == "pexpire" {
-		unit = time.Millisecond
+	ms, valid := expireMillis(amount, name == "expire", false, s.profile.atLeast(7, 0))
+	if !valid {
+		return errorf("ERR invalid expire time in '%s' command", name)
 	}
-	if s.store.Expire(state.db, args[1], time.Now().Add(time.Duration(amount)*unit)) {
+	if s.store.Expire(state.db, args[1], time.UnixMilli(ms)) {
 		return IntegerReply(1)
 	}
 	return IntegerReply(0)
@@ -627,6 +652,15 @@ func (s *RedisServer) configGet(patterns []string) RESPValue {
 	return Map(items...)
 }
 
+// configCharge is what a config value takes from the data budget: the bytes
+// it has beyond the persona's default value.
+func (s *RedisServer) configCharge(key, value string) int64 {
+	if extra := len(value) - len(s.configDefaults[key]); extra > 0 {
+		return int64(extra)
+	}
+	return 0
+}
+
 var immutableConfigs = map[string]bool{
 	"daemonize": true, "databases": true, "logfile": true, "pidfile": true,
 	"supervised": true, "unixsocket": true, "unixsocketperm": true, "aclfile": true,
@@ -704,10 +738,20 @@ func (s *RedisServer) configSet(state *clientState, pairs []string) RESPValue {
 	}
 
 	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	var delta int64
+	for key, value := range updates {
+		delta += s.configCharge(key, value) - s.configCharge(key, s.config[key])
+	}
+	if delta > 0 && !s.budget.reserve(delta) {
+		return oomError
+	}
 	for key, value := range updates {
 		s.config[key] = value
 	}
-	s.configMu.Unlock()
+	if delta < 0 {
+		s.budget.release(-delta)
+	}
 	return SimpleString("OK")
 }
 
@@ -740,6 +784,14 @@ func fakeDirExists(dir string, configured string) bool {
 	return fakeDirs[dir] || dir == configured
 }
 
+// maxClientAttrBytes caps what a connection keeps of its name and library
+// fields; Redis keeps any length, real clients send a few dozen bytes.
+const maxClientAttrBytes = 4096
+
+func capClientAttr(value string) string {
+	return truncateBytes(value, maxClientAttrBytes)
+}
+
 func validClientName(name string) bool {
 	for i := 0; i < len(name); i++ {
 		if name[i] < '!' || name[i] > '~' {
@@ -764,7 +816,7 @@ func (s *RedisServer) handleClient(state *clientState, args []string) RESPValue 
 		if !validClientName(args[2]) {
 			return ErrorReply("ERR Client names cannot contain spaces, newlines or special characters.")
 		}
-		state.name = args[2]
+		state.name = capClientAttr(args[2])
 		if args[2] == HealthcheckClientName && state.trustedLocal {
 			state.suppressLogs = true
 		}
@@ -773,14 +825,19 @@ func (s *RedisServer) handleClient(state *clientState, args []string) RESPValue 
 		if !s.profile.atLeast(7, 2) {
 			return legacy()
 		}
+		var target *string
 		switch strings.ToLower(args[2]) {
 		case "lib-name":
-			state.libName = args[3]
+			target = &state.libName
 		case "lib-ver":
-			state.libVersion = args[3]
+			target = &state.libVersion
 		default:
-			return errorf("ERR Unrecognized option '%s'", args[2])
+			return errorf("ERR Unrecognized option '%s'", truncateBytes(args[2], 128))
 		}
+		if !validClientName(args[3]) {
+			return errorf("ERR %s cannot contain spaces, newlines or special characters.", args[2])
+		}
+		*target = capClientAttr(args[3])
 		return SimpleString("OK")
 	case "getname":
 		if len(args) != 2 {

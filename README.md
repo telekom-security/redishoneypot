@@ -18,6 +18,9 @@ This service is intentionally deceptive. Run it only in an isolated monitoring e
   `EVAL`/`SCRIPT`/`FUNCTION` answer without running Lua; `SLAVEOF` turns the
   server into a read-only replica with a down link; `PSYNC` sends a valid RDB.
 - Flat JSON logs with full payload capture, IOC extraction and analysis hints.
+- Bounded by design: every log field and line is capped, data, cached scripts
+  and replies have byte budgets, and one source address gets a limited number
+  of connections (see [Limits](#limits)).
 - Nothing is executed, written to disk or connected to: all state is in memory.
 
 ## Build
@@ -42,15 +45,48 @@ Useful flags:
 -max-bulk-bytes            Maximum RESP bulk string size. Default: 1048576
 -max-command-bytes         Maximum summed bulk payload of one command. Default: 4194304
 -max-clients               Maximum concurrent connections. Default: 1024
+-max-clients-per-ip        Maximum concurrent connections of one source address; negative: no limit. Default: 16
+-max-data-bytes            Bytes of keys, cached scripts and CONFIG values; writes above get Redis' OOM error. Default: 67108864
+-max-reply-bytes           Bytes of large replies (64 KiB and more) held at once; a connection over it is closed. Default: 67108864
+-replica-state-ttl         How long a source address keeps the master it set with SLAVEOF. Default: 30m
 -max-logged-payload-bytes  Bytes of SET values, scripts and CONFIG values kept in logs. Default: 8192
 -log-file                  Optional JSONL event log file
 -log-stdout                Also write honeypot events to stdout when -log-file is set. Default: true
 -num                       Deprecated compatibility flag; accepted but ignored
 ```
 
-Worst-case parser memory is roughly `max-clients × max-command-bytes`. The
-Docker image uses `-max-clients 128 -max-command-bytes 1048576` with a 256 MiB
-Compose memory limit. `INFO` keeps reporting the persona's `maxclients:10000`.
+## Limits
+
+Worst-case memory is roughly `max-clients × max-command-bytes` for the
+parser plus `max-data-bytes` plus `max-reply-bytes`. The Docker image uses
+`-max-clients 128 -max-command-bytes 1048576 -max-data-bytes 33554432
+-max-reply-bytes 33554432` and `GOMEMLIMIT=200MiB` with a 256 MiB Compose
+memory limit. `INFO` keeps reporting the persona's `maxclients:10000`.
+
+- **Connections.** Above `-max-clients`, or above `-max-clients-per-ip` for
+  one source address, a new connection gets `-ERR max number of clients
+  reached` and is closed. It is logged as a `refused` event with `reason`
+  (`max_clients` or `max_clients_per_ip`) and `refused_count`; one source
+  address gets at most one such line per minute, `refused_count` includes the
+  refusals in between.
+- **Data.** Keys count with their key, value and 64 bytes each; cached scripts
+  (at most 1024 and 8 MiB, the oldest are dropped) and CONFIG values longer
+  than the persona's defaults count too. A `SET` or `CONFIG SET` above
+  `-max-data-bytes` gets `-OOM command not allowed when used memory >
+  'maxmemory'.`; a script that does not fit is answered but not cached.
+  `used_memory` in `INFO` is the persona's idle value plus these bytes.
+- **Replies.** A reply of 64 KiB or more (`GET`, `KEYS`, `SYNC` / `PSYNC`, ...)
+  counts against `-max-reply-bytes` until it is written. A connection whose
+  reply does not fit is closed without a reply, like Redis' output buffer
+  limit; its `command` event has `outcome` `connection_closed` and
+  `reply_limited`.
+- **Client metadata.** The connection keeps at most 4 KiB of `CLIENT SETNAME`,
+  `HELLO ... SETNAME` and `CLIENT SETINFO` values; `CLIENT SETINFO` refuses
+  spaces, newlines and special characters like Redis 7.2.
+- **Replication.** `SLAVEOF` / `REPLICAOF` turn the server into a replica for
+  the source address that sent it only, until `SLAVEOF NO ONE` or
+  `-replica-state-ttl` after its last `SLAVEOF`. Keys and `CONFIG` stay shared.
+- **Writes.** Every reply write has a 10 s deadline.
 
 ## Docker
 
@@ -162,7 +198,7 @@ Logs are flat JSON lines on stdout. Field names use snake case and values are pr
 Event names include:
 
 ```text
-start connect command protocol_error close shutdown_requested
+start connect command protocol_error close refused shutdown_requested
 ```
 
 Connection and command events include:
@@ -191,11 +227,11 @@ script_sha1 script_sha256 script_size script_text script_truncated script_numkey
 target_dir target_dbfilename ioc_urls ioc_ips ioc_domains ioc_count
 ```
 
-`value_text`, `script_text` and `config_value` keep up to `-max-logged-payload-bytes`. `ioc_*` fields are space-separated lists (at most 16 entries each) extracted from all arguments. `script_sha1` matches the SHA1 used by `EVALSHA`, so loads and later calls can be correlated.
+`value_text`, `script_text` and `config_value` keep up to `-max-logged-payload-bytes`. Every other field an attacker controls is capped too: `client_name`, `client_library_name` and `client_library_version` at 128 bytes, `user_agent` at 257, `command`, the key, config, replication, module, script, target and auth fields and each IOC entry at 1024 bytes. A cut field gets `<field>_truncated: true` next to it (`ioc_truncated` for the IOC lists). A line is at most 64 KiB; above that the largest fields are dropped and the line gets `log_truncated: true`. `ioc_*` fields are space-separated lists (at most 16 entries each) extracted from all arguments. `script_sha1` matches the SHA1 used by `EVALSHA`, so loads and later calls can be correlated.
 
 `analysis_hint` values include `redis_write_file_attempt`, `redis_write_file_commit` (`SAVE`/`BGSAVE` after the session changed `dir`/`dbfilename`, with `target_dir`/`target_dbfilename`), `redis_save_attempt`, `ssh_key_payload`, `cron_payload`, `redis_replication_attempt`, `redis_module_load_attempt`, `redis_auth_attempt`, `redis_auth_config_attempt`, `redis_lua_eval`, `redis_lua_script_load` and `redis_function_load`. `outcome` is `success`, `error` or `connection_closed` (HTTP requests, which Redis drops silently).
 
-Redis does not have an HTTP-style User-Agent header. The `user_agent` field is populated when a client sends Redis client metadata with `CLIENT SETINFO LIB-NAME ...` and optionally `CLIENT SETINFO LIB-VER ...`; otherwise the field is omitted. `AUTH` passwords and `CONFIG SET requirepass` values are redacted from `args_text` while their SHA-256 hashes and lengths are still logged for correlation.
+Redis does not have an HTTP-style User-Agent header. The `user_agent` field is populated when a client sends Redis client metadata with `CLIENT SETINFO LIB-NAME ...` and optionally `CLIENT SETINFO LIB-VER ...`; otherwise the field is omitted. Passwords of `AUTH`, `HELLO ... AUTH`, `MIGRATE ... AUTH` / `AUTH2` and `CONFIG SET requirepass` / `masterauth` are redacted from `args_text` and `config_value` while their SHA-256 hashes (and for `AUTH` their lengths) are still logged for correlation.
 
 Example:
 

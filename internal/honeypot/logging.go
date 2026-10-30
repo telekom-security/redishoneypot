@@ -1,6 +1,7 @@
 package honeypot
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -18,10 +20,28 @@ import (
 const (
 	maxLoggedArgsBytes           = 512
 	defaultMaxLoggedPayloadBytes = 8192
+	// maxLoggedFieldBytes caps every other attacker controlled log field.
+	maxLoggedFieldBytes = 1024
+	// maxLoggedClientBytes caps the client name and library fields, which go
+	// into every line of a session.
+	maxLoggedClientBytes = 128
+	// maxLogLineBytes caps a whole JSON line; above it the largest attacker
+	// fields are dropped and the line carries log_truncated.
+	maxLogLineBytes = 64 * 1024
 )
 
+// NewJSONLogger writes one JSON object per line, each at most maxLogLineBytes.
 func NewJSONLogger(w io.Writer) *slog.Logger {
-	return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{
+	return newCappedJSONLogger(w, maxLogLineBytes)
+}
+
+func newCappedJSONLogger(w io.Writer, limit int) *slog.Logger {
+	core := &lineCapCore{w: w, limit: limit}
+	return slog.New(&lineCapHandler{core: core, inner: newJSONHandler(&core.buf)})
+}
+
+func newJSONHandler(w io.Writer) slog.Handler {
+	return slog.NewJSONHandler(w, &slog.HandlerOptions{
 		ReplaceAttr: func(_ []string, attr slog.Attr) slog.Attr {
 			if attr.Value.Kind() == slog.KindAny && attr.Value.Any() == nil {
 				return slog.Attr{}
@@ -37,7 +57,83 @@ func NewJSONLogger(w io.Writer) *slog.Logger {
 			}
 			return attr
 		},
-	}))
+	})
+}
+
+type lineCapCore struct {
+	mu    sync.Mutex
+	buf   bytes.Buffer
+	w     io.Writer
+	limit int
+}
+
+// lineCapHandler encodes each record into a buffer first, so a line over the
+// limit can be encoded again without its largest fields before it is written.
+type lineCapHandler struct {
+	core  *lineCapCore
+	inner slog.Handler
+}
+
+// keptLogFields are never dropped from an oversized line.
+var keptLogFields = map[string]bool{
+	"event": true, "protocol": true, "network": true, "profile": true,
+	"session_id": true, "src_ip": true, "dest_ip": true, "session_start": true,
+	"session_end": true, "command": true, "command_category": true,
+	"outcome": true, "analysis_hint": true, "reason": true, "error": true,
+}
+
+func (h *lineCapHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.inner.Enabled(ctx, level)
+}
+
+func (h *lineCapHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &lineCapHandler{core: h.core, inner: h.inner.WithAttrs(attrs)}
+}
+
+func (h *lineCapHandler) WithGroup(name string) slog.Handler {
+	return &lineCapHandler{core: h.core, inner: h.inner.WithGroup(name)}
+}
+
+func (h *lineCapHandler) Handle(ctx context.Context, record slog.Record) error {
+	c := h.core
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.buf.Reset()
+	if err := h.inner.Handle(ctx, record); err != nil {
+		return err
+	}
+	if c.limit > 0 && c.buf.Len() > c.limit {
+		attrs := make([]slog.Attr, 0, record.NumAttrs()+1)
+		record.Attrs(func(attr slog.Attr) bool {
+			attrs = append(attrs, attr)
+			return true
+		})
+		for c.buf.Len() > c.limit {
+			largest := -1
+			for i, attr := range attrs {
+				if keptLogFields[attr.Key] || attr.Value.Kind() != slog.KindString {
+					continue
+				}
+				if largest < 0 || len(attr.Value.String()) > len(attrs[largest].Value.String()) {
+					largest = i
+				}
+			}
+			if largest < 0 {
+				break
+			}
+			attrs = append(attrs[:largest], attrs[largest+1:]...)
+			shrunk := slog.NewRecord(record.Time, record.Level, record.Message, record.PC)
+			shrunk.AddAttrs(attrs...)
+			shrunk.AddAttrs(slog.Bool("log_truncated", true))
+			c.buf.Reset()
+			if err := h.inner.Handle(ctx, shrunk); err != nil {
+				return err
+			}
+		}
+	}
+	_, err := c.w.Write(c.buf.Bytes())
+	return err
 }
 
 func (s *RedisServer) logConnect(state *clientState, conn net.Conn) {
@@ -61,9 +157,9 @@ func (s *RedisServer) logCommand(state *clientState, conn net.Conn, args []strin
 	command := strings.ToUpper(args[0])
 	logArgs := redactedArgsForLog(args)
 
+	attrs = append(attrs, slog.Int("redis_db", state.db))
+	attrs = appendCapped(attrs, "command", command, maxLoggedFieldBytes)
 	attrs = append(attrs,
-		slog.Int("redis_db", state.db),
-		slog.String("command", command),
 		slog.String("command_category", commandCategory(command)),
 		slog.Int("arg_count", len(args)-1),
 		slog.String("response_class", result.reply.Class()),
@@ -71,6 +167,9 @@ func (s *RedisServer) logCommand(state *clientState, conn net.Conn, args []strin
 		slog.String("outcome", commandOutcome(result)),
 		slog.Bool("close_after_command", result.close),
 	)
+	if result.replyLimited {
+		attrs = append(attrs, slog.Bool("reply_limited", true))
+	}
 	if len(logArgs) > 1 {
 		argsText, argsTruncated := joinArgsForLog(logArgs[1:], maxLoggedArgsBytes)
 		attrs = append(attrs,
@@ -126,19 +225,37 @@ func (s *RedisServer) baseLogAttrs(event string, state *clientState, conn net.Co
 	if !sessionEnd.IsZero() {
 		attrs = append(attrs, slog.String("session_end", formatLogTime(sessionEnd)))
 	}
-	attrs = appendNonEmptyStringAttr(attrs, "client_name", state.name)
-	attrs = appendNonEmptyStringAttr(attrs, "client_library_name", state.libName)
-	attrs = appendNonEmptyStringAttr(attrs, "client_library_version", state.libVersion)
-	attrs = appendNonEmptyStringAttr(attrs, "user_agent", state.userAgent())
+	attrs = appendNonEmptyCapped(attrs, "client_name", state.name, maxLoggedClientBytes)
+	attrs = appendNonEmptyCapped(attrs, "client_library_name", state.libName, maxLoggedClientBytes)
+	attrs = appendNonEmptyCapped(attrs, "client_library_version", state.libVersion, maxLoggedClientBytes)
+	attrs = appendNonEmptyCapped(attrs, "user_agent", state.userAgent(), 2*maxLoggedClientBytes+1)
 
 	return attrs
 }
 
-func appendNonEmptyStringAttr(attrs []slog.Attr, key string, value string) []slog.Attr {
+func appendNonEmptyCapped(attrs []slog.Attr, key string, value string, limit int) []slog.Attr {
 	if value == "" {
 		return attrs
 	}
-	return append(attrs, slog.String(key, value))
+	return appendCapped(attrs, key, value, limit)
+}
+
+// appendCapped logs an attacker controlled string cut to limit bytes on a rune
+// boundary; a cut value gets <key>_truncated next to it.
+func appendCapped(attrs []slog.Attr, key string, value string, limit int) []slog.Attr {
+	text, truncated := capString(value, limit)
+	attrs = append(attrs, slog.String(key, text))
+	if truncated {
+		attrs = append(attrs, slog.Bool(key+"_truncated", true))
+	}
+	return attrs
+}
+
+func capString(value string, limit int) (string, bool) {
+	if len(value) <= limit {
+		return value, false
+	}
+	return joinArgsForLog([]string{value}, limit)
 }
 
 func formatLogTime(value time.Time) string {
@@ -206,11 +323,46 @@ func redactedArgsForLog(args []string) []string {
 			out[2] = "[password redacted]"
 		}
 	case "config":
-		if len(out) == 4 && strings.EqualFold(out[1], "set") && strings.EqualFold(out[2], "requirepass") {
-			out[3] = "[password redacted]"
+		if len(out) >= 4 && strings.EqualFold(out[1], "set") {
+			for i := 2; i+1 < len(out); i += 2 {
+				if isSecretConfig(out[i]) {
+					out[i+1] = "[password redacted]"
+				}
+			}
+		}
+	case "hello":
+		for i := 2; i < len(out); i++ {
+			if strings.EqualFold(out[i], "auth") && i+2 < len(out) {
+				out[i+2] = "[password redacted]"
+				i += 2
+			}
+		}
+	case "migrate":
+		for i := 6; i < len(out); i++ {
+			switch strings.ToLower(out[i]) {
+			case "auth":
+				if i+1 < len(out) {
+					out[i+1] = "[password redacted]"
+					i++
+				}
+			case "auth2":
+				if i+2 < len(out) {
+					out[i+2] = "[password redacted]"
+					i += 2
+				}
+			}
 		}
 	}
 	return out
+}
+
+// isSecretConfig names the CONFIG SET keys whose values are passwords.
+func isSecretConfig(key string) bool {
+	switch strings.ToLower(key) {
+	case "requirepass", "masterauth":
+		return true
+	}
+	return false
 }
 
 func hashArgs(args []string) string {
@@ -263,10 +415,8 @@ func (s *RedisServer) sessionAnalysisAttrs(state *clientState, args []string, re
 	case "save", "bgsave":
 		if succeeded && state.writeTargetSet && len(attrs) > 0 && attrs[0].Key == "analysis_hint" {
 			attrs[0] = slog.String("analysis_hint", "redis_write_file_commit")
-			attrs = append(attrs,
-				slog.String("target_dir", s.configValue("dir")),
-				slog.String("target_dbfilename", s.configValue("dbfilename")),
-			)
+			attrs = appendCapped(attrs, "target_dir", s.configValue("dir"), maxLoggedFieldBytes)
+			attrs = appendCapped(attrs, "target_dbfilename", s.configValue("dbfilename"), maxLoggedFieldBytes)
 		}
 	}
 
@@ -291,7 +441,8 @@ func commandAnalysisAttrsLimit(args []string, payloadLimit int) []slog.Attr {
 	switch command {
 	case "get", "set", "type", "ttl":
 		if len(args) > 1 {
-			attrs = append(attrs, slog.String("key", args[1]), slog.Int("key_count", 1))
+			attrs = appendCapped(attrs, "key", args[1], maxLoggedFieldBytes)
+			attrs = append(attrs, slog.Int("key_count", 1))
 		}
 		if command == "set" && len(args) > 2 {
 			valueText, truncated := joinArgsForLog([]string{args[2]}, payloadLimit)
@@ -304,22 +455,23 @@ func commandAnalysisAttrsLimit(args []string, payloadLimit int) []slog.Attr {
 		}
 	case "mget", "del", "exists":
 		if len(args) > 1 {
-			attrs = append(attrs, slog.String("key", args[1]), slog.Int("key_count", len(args)-1))
+			attrs = appendCapped(attrs, "key", args[1], maxLoggedFieldBytes)
+			attrs = append(attrs, slog.Int("key_count", len(args)-1))
 		}
 	case "keys":
 		if len(args) > 1 {
-			attrs = append(attrs, slog.String("key_pattern", args[1]))
+			attrs = appendCapped(attrs, "key_pattern", args[1], maxLoggedFieldBytes)
 		}
 	case "config":
 		if len(args) > 1 {
-			attrs = append(attrs, slog.String("config_subcommand", strings.ToLower(args[1])))
+			attrs = appendCapped(attrs, "config_subcommand", strings.ToLower(args[1]), maxLoggedFieldBytes)
 		}
 		if len(args) > 2 {
-			attrs = append(attrs, slog.String("config_key", strings.ToLower(args[2])))
+			attrs = appendCapped(attrs, "config_key", strings.ToLower(args[2]), maxLoggedFieldBytes)
 		}
 		if len(args) > 3 {
 			value := args[3]
-			if strings.EqualFold(args[2], "requirepass") {
+			if isSecretConfig(args[2]) {
 				value = "[password redacted]"
 			}
 			valueText, truncated := joinArgsForLog([]string{value}, payloadLimit)
@@ -332,7 +484,7 @@ func commandAnalysisAttrsLimit(args []string, payloadLimit int) []slog.Attr {
 	case "auth":
 		passwordIndex := 1
 		if len(args) == 3 {
-			attrs = append(attrs, slog.String("auth_username", args[1]))
+			attrs = appendCapped(attrs, "auth_username", args[1], maxLoggedFieldBytes)
 			passwordIndex = 2
 		}
 		if len(args) > passwordIndex {
@@ -343,28 +495,28 @@ func commandAnalysisAttrsLimit(args []string, payloadLimit int) []slog.Attr {
 		}
 	case "slaveof", "replicaof":
 		if len(args) > 1 {
-			attrs = append(attrs, slog.String("replica_host", args[1]))
+			attrs = appendCapped(attrs, "replica_host", args[1], maxLoggedFieldBytes)
 		}
 		if len(args) > 2 {
-			attrs = append(attrs, slog.String("replica_port", args[2]))
+			attrs = appendCapped(attrs, "replica_port", args[2], maxLoggedFieldBytes)
 		}
 	case "replconf":
 		if len(args) > 1 {
-			attrs = append(attrs, slog.String("replconf_key", strings.ToLower(args[1])))
+			attrs = appendCapped(attrs, "replconf_key", strings.ToLower(args[1]), maxLoggedFieldBytes)
 		}
 		if len(args) > 2 {
-			attrs = append(attrs, slog.String("replconf_value", args[2]))
+			attrs = appendCapped(attrs, "replconf_value", args[2], maxLoggedFieldBytes)
 		}
 	case "module":
 		if len(args) > 1 {
-			attrs = append(attrs, slog.String("module_subcommand", strings.ToLower(args[1])))
+			attrs = appendCapped(attrs, "module_subcommand", strings.ToLower(args[1]), maxLoggedFieldBytes)
 		}
 		if len(args) > 2 {
-			attrs = append(attrs, slog.String("module_path", args[2]))
+			attrs = appendCapped(attrs, "module_path", args[2], maxLoggedFieldBytes)
 		}
 	case "client":
 		if len(args) > 1 {
-			attrs = append(attrs, slog.String("client_subcommand", strings.ToLower(args[1])))
+			attrs = appendCapped(attrs, "client_subcommand", strings.ToLower(args[1]), maxLoggedFieldBytes)
 		}
 	case "eval", "eval_ro":
 		if len(args) > 1 {
@@ -377,7 +529,7 @@ func commandAnalysisAttrsLimit(args []string, payloadLimit int) []slog.Attr {
 		}
 	case "evalsha", "evalsha_ro":
 		if len(args) > 1 {
-			attrs = append(attrs, slog.String("script_sha1", strings.ToLower(args[1])))
+			attrs = appendCapped(attrs, "script_sha1", strings.ToLower(args[1]), maxLoggedFieldBytes)
 		}
 	case "script":
 		if len(args) > 2 && strings.EqualFold(args[1], "load") {
@@ -475,4 +627,64 @@ func payloadHint(value string) string {
 
 func genericAnalysisHint(command string) string {
 	return fmt.Sprintf("redis_%s", strings.ToLower(command))
+}
+
+const (
+	// refusedLogInterval is how often one source address gets a refused line.
+	refusedLogInterval = time.Minute
+	// maxRefusedSources bounds the addresses whose refusals are counted.
+	maxRefusedSources = 4096
+)
+
+type refusedLog struct {
+	last       time.Time
+	suppressed int
+}
+
+// logRefused logs a connection refused for a client limit. One source address
+// gets at most one line per refusedLogInterval; refused_count includes the
+// refusals in between that were not logged.
+func (s *RedisServer) logRefused(conn net.Conn, reason string) {
+	ip := peerIP(conn.RemoteAddr())
+	now := time.Now()
+
+	s.refusedMu.Lock()
+	entry := s.refusedLogs[ip]
+	if entry != nil && now.Sub(entry.last) < refusedLogInterval {
+		entry.suppressed++
+		s.refusedMu.Unlock()
+		return
+	}
+	count := 1
+	if entry != nil {
+		count += entry.suppressed
+	}
+	if entry == nil && len(s.refusedLogs) >= maxRefusedSources {
+		for key, old := range s.refusedLogs {
+			if now.Sub(old.last) >= refusedLogInterval {
+				delete(s.refusedLogs, key)
+			}
+		}
+		if len(s.refusedLogs) >= maxRefusedSources {
+			s.refusedMu.Unlock()
+			return
+		}
+	}
+	s.refusedLogs[ip] = &refusedLog{last: now}
+	s.refusedMu.Unlock()
+
+	srcIP, srcPort := splitAddr(conn.RemoteAddr())
+	destIP, destPort := splitAddr(conn.LocalAddr())
+	s.logger.LogAttrs(context.Background(), slog.LevelInfo, "refused",
+		slog.String("event", "refused"),
+		slog.String("protocol", "redis"),
+		slog.String("network", s.options.Network),
+		slog.String("profile", s.profile.Name),
+		slog.String("src_ip", srcIP),
+		slog.Int("src_port", srcPort),
+		slog.String("dest_ip", destIP),
+		slog.Int("dest_port", destPort),
+		slog.String("reason", reason),
+		slog.Int("refused_count", count),
+	)
 }

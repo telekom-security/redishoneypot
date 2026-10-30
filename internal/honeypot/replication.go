@@ -9,26 +9,43 @@ import (
 
 // replicationState records SLAVEOF/REPLICAOF. The honeypot never connects to
 // the named master; it reports the link as down, like a real replica whose
-// master is unreachable.
+// master is unreachable. The state belongs to the source address that set it,
+// so one attacker never sees the master another one named, and it is
+// forgotten ReplicaStateTTL after that address last sent SLAVEOF.
 type replicationState struct {
 	masterHost string
 	masterPort int
 	since      time.Time
+	touched    time.Time
 }
 
-func (s *RedisServer) replication() (replicationState, bool) {
+// maxReplicaSources bounds the addresses with a replication state.
+const maxReplicaSources = 4096
+
+// maxMasterHostBytes caps the master host a replica state keeps.
+const maxMasterHostBytes = 1024
+
+func (s *RedisServer) replication(state *clientState) (replicationState, bool) {
 	s.replMu.Lock()
 	defer s.replMu.Unlock()
-	return s.repl, s.repl.masterHost != ""
+	repl, ok := s.replicas[state.remoteIP]
+	if !ok {
+		return replicationState{}, false
+	}
+	if time.Since(repl.touched) > s.options.ReplicaStateTTL {
+		delete(s.replicas, state.remoteIP)
+		return replicationState{}, false
+	}
+	return *repl, true
 }
 
-func (s *RedisServer) isReplica() bool {
-	_, replica := s.replication()
+func (s *RedisServer) isReplica(state *clientState) bool {
+	_, replica := s.replication(state)
 	return replica
 }
 
-func (s *RedisServer) isReadOnlyReplica() bool {
-	if !s.isReplica() {
+func (s *RedisServer) isReadOnlyReplica(state *clientState) bool {
+	if !s.isReplica(state) {
 		return false
 	}
 	setting := s.configValue("replica-read-only")
@@ -38,10 +55,10 @@ func (s *RedisServer) isReadOnlyReplica() bool {
 	return setting != "no"
 }
 
-func (s *RedisServer) handleReplicaOf(args []string) RESPValue {
+func (s *RedisServer) handleReplicaOf(state *clientState, args []string) RESPValue {
 	if strings.EqualFold(args[1], "no") && strings.EqualFold(args[2], "one") {
 		s.replMu.Lock()
-		s.repl = replicationState{}
+		delete(s.replicas, state.remoteIP)
 		s.replMu.Unlock()
 		return SimpleString("OK")
 	}
@@ -54,17 +71,46 @@ func (s *RedisServer) handleReplicaOf(args []string) RESPValue {
 		return notIntegerErr
 	}
 
+	host := truncateBytes(args[1], maxMasterHostBytes)
+	now := time.Now()
 	s.replMu.Lock()
 	defer s.replMu.Unlock()
-	if strings.EqualFold(s.repl.masterHost, args[1]) && s.repl.masterPort == int(port) {
-		return SimpleString("OK Already connected to specified master")
+	if repl, ok := s.replicas[state.remoteIP]; ok && now.Sub(repl.touched) <= s.options.ReplicaStateTTL {
+		repl.touched = now
+		if strings.EqualFold(repl.masterHost, host) && repl.masterPort == int(port) {
+			return SimpleString("OK Already connected to specified master")
+		}
+		*repl = replicationState{masterHost: host, masterPort: int(port), since: now, touched: now}
+		return SimpleString("OK")
 	}
-	s.repl = replicationState{masterHost: args[1], masterPort: int(port), since: time.Now()}
+	if len(s.replicas) >= maxReplicaSources {
+		s.pruneReplicas(now)
+	}
+	s.replicas[state.remoteIP] = &replicationState{masterHost: host, masterPort: int(port), since: now, touched: now}
 	return SimpleString("OK")
 }
 
-func (s *RedisServer) handleRole() RESPValue {
-	if repl, replica := s.replication(); replica {
+// pruneReplicas drops expired replica states and, when none expired, the one
+// touched longest ago. The caller must hold s.replMu.
+func (s *RedisServer) pruneReplicas(now time.Time) {
+	oldestIP := ""
+	var oldest time.Time
+	for ip, repl := range s.replicas {
+		if now.Sub(repl.touched) > s.options.ReplicaStateTTL {
+			delete(s.replicas, ip)
+			continue
+		}
+		if oldestIP == "" || repl.touched.Before(oldest) {
+			oldestIP, oldest = ip, repl.touched
+		}
+	}
+	if len(s.replicas) >= maxReplicaSources {
+		delete(s.replicas, oldestIP)
+	}
+}
+
+func (s *RedisServer) handleRole(state *clientState) RESPValue {
+	if repl, replica := s.replication(state); replica {
 		return Array(
 			BulkString("slave"),
 			BulkString(repl.masterHost),
@@ -76,18 +122,28 @@ func (s *RedisServer) handleRole() RESPValue {
 	return Array(BulkString("master"), IntegerReply(0), Array())
 }
 
-func (s *RedisServer) handleSync(state *clientState, name string) RESPValue {
-	if s.isReplica() {
-		return ErrorReply("NOMASTERLINK Can't SYNC while not connected with my master")
+// handleSync sends the keyspace as an RDB file. Its size counts against
+// MaxReplyBytes while it is built and written; when it does not fit the
+// connection is closed without a reply, like Redis' replica output limit.
+func (s *RedisServer) handleSync(state *clientState, name string) commandResult {
+	if s.isReplica(state) {
+		return ok(ErrorReply("NOMASTERLINK Can't SYNC while not connected with my master"))
+	}
+	// The RDB and the reply that carries it are two copies of the data.
+	reserve := 2 * (s.budget.bytes() + 4096)
+	if !s.reserveReply(reserve) {
+		return commandResult{reply: RawReply(""), silent: true, close: true, replyLimited: true}
 	}
 	s.syncFull.Add(1)
 	state.replica = true
 	rdb := s.buildRDB()
 	payload := "$" + strconv.Itoa(len(rdb)) + "\r\n" + string(rdb)
-	if name == "sync" {
-		return RawReply(payload)
+	result := ok(RawReply(payload))
+	if name != "sync" {
+		result = ok(RawReply("+FULLRESYNC " + s.runtime.masterReplID + " 0\r\n" + payload))
 	}
-	return RawReply("+FULLRESYNC " + s.runtime.masterReplID + " 0\r\n" + payload)
+	result.reserved = reserve
+	return result
 }
 
 // buildRDB serializes the keyspace as an RDB file of the persona's version,
@@ -109,7 +165,8 @@ func (s *RedisServer) buildRDB() []byte {
 	aux(verKey, s.profile.Version)
 	aux("redis-bits", "64")
 	aux("ctime", strconv.FormatInt(time.Now().Unix(), 10))
-	aux("used-mem", strconv.FormatInt(s.runtime.usedMemory.Load(), 10))
+	usedMemory, _, _ := s.runtime.memory(s.budget.bytes())
+	aux("used-mem", strconv.FormatInt(usedMemory, 10))
 	if s.profile.atLeast(4, 0) {
 		aux("repl-stream-db", "0")
 		aux("repl-id", s.runtime.masterReplID)

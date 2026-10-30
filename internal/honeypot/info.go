@@ -67,7 +67,7 @@ func (s *RedisServer) infoSectionLines(state *clientState, section infoSection, 
 	case "latencystats":
 		return s.latencystatsLines()
 	case "replication":
-		if repl, replica := s.replication(); replica {
+		if repl, replica := s.replication(state); replica {
 			return s.replicaLines(section, values, repl)
 		}
 	}
@@ -96,12 +96,7 @@ func (s *RedisServer) infoValues(state *clientState) map[string]string {
 		port = tcpAddr.Port
 	}
 
-	usedMemory := fp.usedMemory.Load()
-	rss := fp.usedMemoryRSS.Load()
-	peak := fp.usedMemoryPeak.Load()
-	if peak < usedMemory {
-		peak = usedMemory
-	}
+	usedMemory, rss, peak := fp.memory(s.budget.bytes())
 	peakPercent := 100.0
 	if peak > 0 {
 		peakPercent = float64(usedMemory) / float64(peak) * 100
