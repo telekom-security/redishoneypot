@@ -439,3 +439,13 @@ func hexValue(c byte) byte {
 		return c - 'A' + 10
 	}
 }
+
+// approxSize estimates the encoded size of v without encoding it: its strings
+// plus a few bytes of framing per value.
+func (v RESPValue) approxSize() int64 {
+	size := int64(len(v.str)) + 24
+	for _, item := range v.array {
+		size += item.approxSize()
+	}
+	return size
+}

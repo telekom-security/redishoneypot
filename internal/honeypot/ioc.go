@@ -26,11 +26,18 @@ func iocAttrs(args []string) []slog.Attr {
 
 	var urls, ips, domains []string
 	seen := map[string]bool{}
+	truncated := false
 	add := func(list *[]string, value string) {
-		if value == "" || seen[value] || len(*list) >= maxIOCsPerKind {
+		if value == "" || len(*list) >= maxIOCsPerKind {
+			return
+		}
+		// An entry is cut like any other attacker field.
+		value, cut := capString(value, maxLoggedFieldBytes)
+		if seen[value] {
 			return
 		}
 		seen[value] = true
+		truncated = truncated || cut
 		*list = append(*list, value)
 	}
 
@@ -62,6 +69,9 @@ func iocAttrs(args []string) []slog.Attr {
 	}
 	if count := len(urls) + len(ips) + len(domains); count > 0 {
 		attrs = append(attrs, slog.Int("ioc_count", count))
+	}
+	if truncated {
+		attrs = append(attrs, slog.Bool("ioc_truncated", true))
 	}
 	return attrs
 }

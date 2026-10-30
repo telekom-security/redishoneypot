@@ -3,6 +3,7 @@ package honeypot
 import (
 	"crypto/sha1"
 	"encoding/hex"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -11,15 +12,23 @@ import (
 const maxCachedScripts = 1024
 
 // scriptCache remembers scripts by SHA1 like Redis' script cache. Scripts are
-// never executed.
+// never executed. It keeps at most maxCachedScripts scripts and
+// maxScriptCacheBytes bytes, dropping the oldest, and takes its bytes from the
+// data budget; a script that does not fit is answered but not kept.
 type scriptCache struct {
 	mu      sync.Mutex
 	scripts map[string]string
 	order   []string
+	bytes   int64
+	budget  *memBudget
 }
 
-func newScriptCache() *scriptCache {
-	return &scriptCache{scripts: make(map[string]string)}
+func newScriptCacheWithBudget(budget *memBudget) *scriptCache {
+	return &scriptCache{scripts: make(map[string]string), budget: budget}
+}
+
+func scriptSize(body string) int64 {
+	return int64(len(body) + 40 + entryOverhead)
 }
 
 func scriptSHA1(body string) string {
@@ -29,18 +38,35 @@ func scriptSHA1(body string) string {
 
 func (c *scriptCache) add(body string) string {
 	sha := scriptSHA1(body)
+	size := scriptSize(body)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, ok := c.scripts[sha]; ok {
+	if _, ok := c.scripts[sha]; ok || size > maxScriptCacheBytes {
 		return sha
 	}
-	if len(c.order) >= maxCachedScripts {
-		delete(c.scripts, c.order[0])
-		c.order = c.order[1:]
+	for len(c.order) > 0 && (len(c.order) >= maxCachedScripts || c.bytes+size > maxScriptCacheBytes) {
+		c.dropOldest()
+	}
+	for len(c.order) > 0 && !c.budget.reserve(size) {
+		c.dropOldest()
+	}
+	if len(c.order) == 0 && !c.budget.reserve(size) {
+		return sha
 	}
 	c.scripts[sha] = body
 	c.order = append(c.order, sha)
+	c.bytes += size
 	return sha
+}
+
+// dropOldest removes the oldest script. The caller must hold c.mu.
+func (c *scriptCache) dropOldest() {
+	sha := c.order[0]
+	size := scriptSize(c.scripts[sha])
+	delete(c.scripts, sha)
+	c.order = slices.Delete(c.order, 0, 1)
+	c.bytes -= size
+	c.budget.release(size)
 }
 
 func (c *scriptCache) get(sha string) (string, bool) {
@@ -71,6 +97,8 @@ func (c *scriptCache) flush() {
 	defer c.mu.Unlock()
 	c.scripts = make(map[string]string)
 	c.order = nil
+	c.budget.release(c.bytes)
+	c.bytes = 0
 }
 
 // scriptReply answers a script without running it. Only literal returns are

@@ -34,6 +34,10 @@ func main() {
 	flag.IntVar(&options.MaxBulkBytes, "max-bulk-bytes", options.MaxBulkBytes, "maximum RESP bulk string size")
 	flag.IntVar(&options.MaxCommandBytes, "max-command-bytes", options.MaxCommandBytes, "maximum summed bulk payload of one command")
 	flag.IntVar(&options.MaxClients, "max-clients", options.MaxClients, "maximum concurrent client connections")
+	flag.IntVar(&options.MaxClientsPerIP, "max-clients-per-ip", options.MaxClientsPerIP, "maximum concurrent connections of one source address (negative: no limit)")
+	flag.Int64Var(&options.MaxDataBytes, "max-data-bytes", options.MaxDataBytes, "maximum bytes of keys, cached scripts and CONFIG values; writes above it get an OOM error")
+	flag.Int64Var(&options.MaxReplyBytes, "max-reply-bytes", options.MaxReplyBytes, "maximum bytes of large replies held at once; a connection over it is closed")
+	flag.DurationVar(&options.ReplicaStateTTL, "replica-state-ttl", options.ReplicaStateTTL, "how long a source address keeps the master it set with SLAVEOF / REPLICAOF")
 	flag.IntVar(&options.MaxLoggedPayloadBytes, "max-logged-payload-bytes", options.MaxLoggedPayloadBytes, "maximum bytes of SET values, scripts and CONFIG values in logs")
 	flag.StringVar(&logFilePath, "log-file", "", "optional JSONL honeypot event log file")
 	flag.BoolVar(&logStdout, "log-stdout", true, "also write honeypot events to stdout when -log-file is set")
@@ -94,6 +98,10 @@ func main() {
 		"max_bulk_bytes", options.MaxBulkBytes,
 		"max_command_bytes", options.MaxCommandBytes,
 		"max_clients", options.MaxClients,
+		"max_clients_per_ip", options.MaxClientsPerIP,
+		"max_data_bytes", options.MaxDataBytes,
+		"max_reply_bytes", options.MaxReplyBytes,
+		"replica_state_ttl", options.ReplicaStateTTL.String(),
 		"max_logged_payload_bytes", options.MaxLoggedPayloadBytes,
 	}
 	if logFilePath != "" {

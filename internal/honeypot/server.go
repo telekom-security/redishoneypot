@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -20,6 +21,15 @@ const (
 	defaultMaxArrayElems  = 1024
 	defaultMaxCommandSize = 4 * 1024 * 1024
 	defaultMaxClients     = 1024
+	defaultMaxClientsIP   = 16
+	defaultMaxReplyBytes  = 64 << 20
+	defaultReplicaTTL     = 30 * time.Minute
+
+	// writeTimeout bounds every reply write.
+	writeTimeout = 10 * time.Second
+	// largeReplyBytes is the size from which a reply counts against
+	// MaxReplyBytes; smaller replies are never refused.
+	largeReplyBytes = 64 * 1024
 
 	maxAcceptBackoff = time.Second
 
@@ -37,6 +47,19 @@ type ServerOptions struct {
 	// MaxCommandBytes caps the summed bulk payload of a single command.
 	MaxCommandBytes int
 	MaxClients      int
+	// MaxClientsPerIP caps the open connections of one source address;
+	// 0 means the default, a negative value no limit.
+	MaxClientsPerIP int
+	// MaxDataBytes caps keys, cached scripts and config values together;
+	// writes above it get Redis' OOM error. 0 means the default.
+	MaxDataBytes int64
+	// MaxReplyBytes caps the large replies all connections hold at once; a
+	// connection whose reply does not fit is closed, like Redis' output
+	// buffer limit. 0 means the default.
+	MaxReplyBytes int64
+	// ReplicaStateTTL is how long the master set by SLAVEOF / REPLICAOF is
+	// remembered for its source address after its last such command.
+	ReplicaStateTTL time.Duration
 	// MaxLoggedPayloadBytes caps value_text, script_text and config_value.
 	MaxLoggedPayloadBytes int
 	Logger                *slog.Logger
@@ -61,11 +84,17 @@ type RedisServer struct {
 	connMu sync.Mutex
 	conns  map[net.Conn]struct{}
 
-	configMu sync.RWMutex
-	config   map[string]string
+	configMu       sync.RWMutex
+	config         map[string]string
+	configDefaults map[string]string
 
-	replMu sync.Mutex
-	repl   replicationState
+	replMu   sync.Mutex
+	replicas map[string]*replicationState
+
+	budget      *memBudget
+	replyBytes  atomic.Int64
+	refusedMu   sync.Mutex
+	refusedLogs map[string]*refusedLog
 
 	stats   *serverStats
 	scripts *scriptCache
@@ -137,6 +166,10 @@ func DefaultServerOptions() ServerOptions {
 		MaxArrayElems:         defaultMaxArrayElems,
 		MaxCommandBytes:       defaultMaxCommandSize,
 		MaxClients:            defaultMaxClients,
+		MaxClientsPerIP:       defaultMaxClientsIP,
+		MaxDataBytes:          defaultMaxDataBytes,
+		MaxReplyBytes:         defaultMaxReplyBytes,
+		ReplicaStateTTL:       defaultReplicaTTL,
 		MaxLoggedPayloadBytes: defaultMaxLoggedPayloadBytes,
 		Logger:                NewJSONLogger(os.Stdout),
 		TrustedPeer:           isLoopbackPeer,
@@ -179,6 +212,18 @@ func NewRedisServerWithOptions(options ServerOptions) (*RedisServer, error) {
 	if options.MaxClients <= 0 {
 		options.MaxClients = defaultMaxClients
 	}
+	if options.MaxClientsPerIP == 0 {
+		options.MaxClientsPerIP = defaultMaxClientsIP
+	}
+	if options.MaxDataBytes <= 0 {
+		options.MaxDataBytes = defaultMaxDataBytes
+	}
+	if options.MaxReplyBytes <= 0 {
+		options.MaxReplyBytes = defaultMaxReplyBytes
+	}
+	if options.ReplicaStateTTL <= 0 {
+		options.ReplicaStateTTL = defaultReplicaTTL
+	}
 	if options.MaxLoggedPayloadBytes <= 0 {
 		options.MaxLoggedPayloadBytes = defaultMaxLoggedPayloadBytes
 	}
@@ -194,20 +239,25 @@ func NewRedisServerWithOptions(options ServerOptions) (*RedisServer, error) {
 		return nil, err
 	}
 
+	budget := newMemBudget(options.MaxDataBytes)
 	s := &RedisServer{
-		listener:    listener,
-		store:       NewStore(),
-		profile:     options.Profile,
-		runtime:     newRuntimeFingerprint(options.Profile),
-		logger:      options.Logger,
-		options:     options,
-		startedAt:   time.Now(),
-		done:        make(chan struct{}),
-		conns:       make(map[net.Conn]struct{}),
-		config:      personaConfig(options.Profile),
-		stats:       newServerStats(),
-		scripts:     newScriptCache(),
-		clientsByIP: make(map[string]int),
+		listener:       listener,
+		store:          newStoreWithBudget(budget),
+		budget:         budget,
+		replicas:       make(map[string]*replicationState),
+		refusedLogs:    make(map[string]*refusedLog),
+		profile:        options.Profile,
+		runtime:        newRuntimeFingerprint(options.Profile),
+		logger:         options.Logger,
+		options:        options,
+		startedAt:      time.Now(),
+		done:           make(chan struct{}),
+		conns:          make(map[net.Conn]struct{}),
+		config:         personaConfig(options.Profile),
+		configDefaults: personaConfig(options.Profile),
+		stats:          newServerStats(),
+		scripts:        newScriptCacheWithBudget(budget),
+		clientsByIP:    make(map[string]int),
 	}
 	return s, nil
 }
@@ -244,17 +294,18 @@ func (s *RedisServer) Start() error {
 		}
 		backoff = 0
 
-		accepted, full := s.trackConn(conn)
+		fd, refused, accepted := s.trackConn(conn)
 		if !accepted {
-			if full {
+			if refused != "" {
 				s.rejectedConns.Add(1)
 				_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
 				_, _ = conn.Write(ErrorReply("ERR max number of clients reached").Bytes())
+				s.logRefused(conn, refused)
 			}
 			_ = conn.Close()
 			continue
 		}
-		go s.handleConn(conn)
+		go s.handleConn(conn, fd)
 	}
 }
 
@@ -280,22 +331,29 @@ func (s *RedisServer) Addr() net.Addr {
 }
 
 // trackConn registers conn and its handler goroutine. It refuses connections
-// once Stop has begun and reports full when the client limit is reached.
-func (s *RedisServer) trackConn(conn net.Conn) (accepted bool, full bool) {
+// once Stop has begun, and names the limit (max_clients or
+// max_clients_per_ip) when one is reached. fd is the file descriptor Redis
+// would show for the connection: after its listening and internal ones.
+func (s *RedisServer) trackConn(conn net.Conn) (fd int, refused string, accepted bool) {
 	s.connMu.Lock()
 	defer s.connMu.Unlock()
 	select {
 	case <-s.done:
-		return false, false
+		return 0, "", false
 	default:
 	}
 	if len(s.conns) >= s.options.MaxClients {
-		return false, true
+		return 0, "max_clients", false
 	}
+	ip := peerIP(conn.RemoteAddr())
+	if limit := s.options.MaxClientsPerIP; limit > 0 && s.clientsByIP[ip] >= limit {
+		return 0, "max_clients_per_ip", false
+	}
+	fd = 8 + len(s.conns)
 	s.conns[conn] = struct{}{}
-	s.clientsByIP[peerIP(conn.RemoteAddr())]++
+	s.clientsByIP[ip]++
 	s.wg.Add(1)
-	return true, false
+	return fd, "", true
 }
 
 func (s *RedisServer) removeConn(conn net.Conn) {
@@ -339,7 +397,7 @@ func isLoopbackPeer(addr net.Addr) bool {
 	return ok && tcpAddr.IP.IsLoopback()
 }
 
-func (s *RedisServer) handleConn(conn net.Conn) {
+func (s *RedisServer) handleConn(conn net.Conn, fd int) {
 	defer s.wg.Done()
 	defer s.removeConn(conn)
 	defer conn.Close()
@@ -349,6 +407,11 @@ func (s *RedisServer) handleConn(conn net.Conn) {
 		sessionID:    randomHex(32),
 		connected:    time.Now(),
 		trustedLocal: s.options.TrustedPeer(conn.RemoteAddr()),
+		proto:        2,
+		remoteIP:     peerIP(conn.RemoteAddr()),
+		remoteAddr:   conn.RemoteAddr().String(),
+		localAddr:    conn.LocalAddr().String(),
+		fd:           fd,
 	}
 	s.totalConnections.Add(1)
 	s.activeClients.Add(1)
@@ -383,6 +446,7 @@ func (s *RedisServer) handleConn(conn net.Conn) {
 			}
 			reply := ErrorReply("ERR Protocol error: " + err.Error())
 			s.stats.record("", 0, reply, false)
+			_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 			_, _ = conn.Write(reply.Bytes())
 			break
 		}
@@ -394,6 +458,18 @@ func (s *RedisServer) handleConn(conn net.Conn) {
 		result := s.handleCommand(state, args)
 		elapsed := time.Since(started).Microseconds()
 
+		reserved := result.reserved
+		if !result.silent && !result.noReply && reserved == 0 {
+			if size := result.reply.approxSize(); size >= largeReplyBytes {
+				if s.reserveReply(size) {
+					reserved = size
+				} else {
+					// Like Redis' output buffer limit: no reply, the
+					// connection is closed.
+					result.silent, result.close, result.replyLimited = true, true, true
+				}
+			}
+		}
 		var reply []byte
 		if !result.silent && !result.noReply {
 			reply = result.reply.Encode(state.proto)
@@ -402,7 +478,7 @@ func (s *RedisServer) handleConn(conn net.Conn) {
 			result.reply = RawReply("")
 		}
 
-		requestBytes := int64(len(encodeRequest(args)))
+		requestBytes := requestSize(args)
 		state.netIn += requestBytes
 		state.netOut += int64(len(reply))
 		state.commands++
@@ -415,13 +491,14 @@ func (s *RedisServer) handleConn(conn net.Conn) {
 			s.stats.record(result.statName, elapsed, result.reply, result.rejected)
 		}
 
+		var writeErr error
 		if len(reply) > 0 {
-			if s.options.IdleTimeout > 0 {
-				_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			}
-			if _, err := conn.Write(reply); err != nil {
-				break
-			}
+			_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+			_, writeErr = conn.Write(reply)
+		}
+		s.releaseReply(reserved)
+		if writeErr != nil {
+			break
 		}
 
 		if !state.suppressLogs {
@@ -437,6 +514,26 @@ func (s *RedisServer) handleConn(conn net.Conn) {
 	if !state.suppressLogs {
 		s.ensureConnectLogged(state, conn)
 		s.logClose(state, conn, time.Now())
+	}
+}
+
+// reserveReply counts size against MaxReplyBytes; it fails when the replies
+// in flight would exceed it.
+func (s *RedisServer) reserveReply(size int64) bool {
+	for {
+		used := s.replyBytes.Load()
+		if used+size > s.options.MaxReplyBytes {
+			return false
+		}
+		if s.replyBytes.CompareAndSwap(used, used+size) {
+			return true
+		}
+	}
+}
+
+func (s *RedisServer) releaseReply(size int64) {
+	if size > 0 {
+		s.replyBytes.Add(-size)
 	}
 }
 
@@ -470,6 +567,15 @@ func (s *RedisServer) clientsFrom(ip string) int {
 		return n
 	}
 	return 1
+}
+
+// requestSize is len(encodeRequest(args)) without building the copy.
+func requestSize(args []string) int64 {
+	size := int64(1 + len(strconv.Itoa(len(args))) + 2)
+	for _, arg := range args {
+		size += int64(1 + len(strconv.Itoa(len(arg))) + 2 + len(arg) + 2)
+	}
+	return size
 }
 
 func encodeRequest(args []string) []byte {

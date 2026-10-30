@@ -107,7 +107,6 @@ func (f *runtimeFingerprint) markDirty(changes int64) {
 		return
 	}
 	f.rdbChangesSinceSave.Add(changes)
-	f.updateMemoryForChange(changes)
 }
 
 func (f *runtimeFingerprint) markSaved() {
@@ -117,20 +116,23 @@ func (f *runtimeFingerprint) markSaved() {
 	f.rdbLastBgsaveTimeSec.Store(randomInt64(0, 2))
 }
 
-func (f *runtimeFingerprint) updateMemoryForChange(changes int64) {
-	delta := changes * randomInt64(48, 512)
-	usedMemory := f.usedMemory.Add(delta)
+// memory returns used_memory, used_memory_rss and used_memory_peak for the
+// bytes the data set holds now: the idle base of the persona plus the data,
+// so INFO grows and shrinks with what clients store.
+func (f *runtimeFingerprint) memory(dataBytes int64) (used, rss, peak int64) {
+	base := f.usedMemory.Load()
+	used = base + dataBytes
+	rss = f.usedMemoryRSS.Load() + dataBytes + dataBytes/10
 	for {
-		peak := f.usedMemoryPeak.Load()
-		if usedMemory <= peak {
-			break
-		}
-		newPeak := usedMemory + randomInt64(0, 16*1024)
-		if f.usedMemoryPeak.CompareAndSwap(peak, newPeak) {
+		peak = f.usedMemoryPeak.Load()
+		if used <= peak || f.usedMemoryPeak.CompareAndSwap(peak, used) {
 			break
 		}
 	}
-	f.usedMemoryRSS.Store(int64(float64(usedMemory) * f.fragmentation))
+	if peak < used {
+		peak = used
+	}
+	return used, rss, peak
 }
 
 func (f *runtimeFingerprint) lruClock(uptimeSeconds int64) int64 {
